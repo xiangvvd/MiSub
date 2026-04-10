@@ -20,8 +20,23 @@ const { showToast } = useToastStore();
 // 系统保留路径列表，这些路径会与前端路由或后端 API 冲突
 const RESERVED_PATHS = [
   'settings', 'login', 'groups', 'nodes', 'subscriptions', 'dashboard',
-  'api', 'explore', 'sub', 'cron', 'assets', '@vite', 'public', 'profile', 'offline'
+  'api', 'explore', 'sub', 'cron', 'assets', '@vite', 'public', 'profile', 'offline',
+  'vps', 'monitor', 'logout', 'auth_debug', 'auth_check', 'data', 'kv_test',
+  'clients', 'system', 'github', 'telegram', 'test_notification', 'test_subconverter',
+  'misubs', 'node_count', 'fetch_external_url', 'batch_update_nodes',
+  'subscription_nodes', 'debug_subscription', 'preview'
 ];
+
+const getPathSegment = (value) => value.replace(/^\/+/, '').split('/')[0].toLowerCase();
+
+const rejectReservedToken = (field, value, message) => {
+  if (!value) return false;
+  const pathSegment = getPathSegment(value);
+  if (!RESERVED_PATHS.includes(pathSegment)) return false;
+  props.settings[field] = '';
+  showToast(message, 'error');
+  return true;
+};
 
 // 监听自定义登录路径，禁止特殊字符、空格和保留路径
 watch(() => props.settings.customLoginPath, (val) => {
@@ -37,11 +52,19 @@ watch(() => props.settings.customLoginPath, (val) => {
   }
 
   // 检查是否为保留路径（去除前后斜杠后比较首段）
-  const pathSegment = sanitized.replace(/^\/+/, '').split('/')[0].toLowerCase();
+  const pathSegment = getPathSegment(sanitized);
   if (RESERVED_PATHS.includes(pathSegment)) {
     props.settings.customLoginPath = '';
     showToast(`"/${pathSegment}" 是系统保留路径，不可用作自定义登录路径`, 'error');
   }
+});
+
+watch(() => props.settings.mytoken, (val) => {
+  if (!rejectReservedToken('mytoken', val, '"/monitor" 和 "/vps" 是系统保留路径，不可用作自定义订阅Token')) return;
+});
+
+watch(() => props.settings.profileToken, (val) => {
+  if (!rejectReservedToken('profileToken', val, '"/monitor" 和 "/vps" 是系统保留路径，不可用作订阅组分享Token')) return;
 });
 
 
@@ -151,12 +174,28 @@ watch(() => props.settings.customLoginPath, (val) => {
             <p class="text-sm font-medium text-gray-900 dark:text-gray-200">开启访问日志 & 计数</p>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">记录订阅访问并统计流量与IP</p>
             <p class="text-[11px] text-amber-600 dark:text-amber-400 mt-1">
-              ⚠️ 受 CF KV 最终一致性与缓存机制影响，日志写入和流量统计最高可能有分钟级的延迟，频繁刷新并不能实时反馈。
+              ⚠️ 默认使用轻量持久化模式以节省 Cloudflare 免费版 KV 配额，日志会自动去重并限流，频繁刷新不会完整落库。
             </p>
           </div>
           <Switch 
             v-model="settings.enableAccessLog"
           />
+        </div>
+
+        <div
+          v-if="settings.enableAccessLog"
+          class="p-4 bg-white/70 dark:bg-gray-900/50 border border-gray-200/70 dark:border-white/10 misub-radius-lg space-y-2">
+          <div>
+            <p class="text-sm font-medium text-gray-900 dark:text-gray-200">访问日志持久化模式</p>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">免费版建议保持轻量模式，仅在需要完整审计时再切到完整模式。</p>
+          </div>
+          <select
+            v-model="settings.accessLogPersistenceMode"
+            class="block w-full px-3 py-2 bg-white/80 dark:bg-gray-900/60 border border-gray-200/80 dark:border-white/10 misub-radius-lg shadow-sm focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 sm:text-sm dark:text-white transition-colors"
+          >
+            <option value="light">轻量持久化（推荐）</option>
+            <option value="full">完整持久化</option>
+          </select>
         </div>
 
         <!-- 流量统计节点 -->
@@ -232,10 +271,10 @@ watch(() => props.settings.customLoginPath, (val) => {
              <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                设置后，只有访问此路径才能进入登录页面。默认路径 <code>/login</code> 将失效（除非未设置）。
              </p>
-             <p class="text-xs text-amber-600 dark:text-amber-400 mt-1">
-               ⚠️ 不可使用系统保留路径：/settings, /login, /groups, /nodes, /subscriptions, /dashboard
-             </p>
-          </div>
+              <p class="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                ⚠️ 不可使用系统保留路径：/settings, /login, /groups, /nodes, /subscriptions, /dashboard, /monitor, /vps, /logout, /auth_debug, /auth_check
+              </p>
+           </div>
 
             <div v-show="disguiseConfig.enabled"
             class="bg-white/80 dark:bg-gray-900/60 misub-radius-lg p-4 space-y-4 border border-gray-200/70 dark:border-white/10 transition-all duration-300">

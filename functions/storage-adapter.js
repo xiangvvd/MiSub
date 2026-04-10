@@ -17,6 +17,91 @@ const DATA_KEYS = {
     SETTINGS: 'worker_settings_v1'
 };
 
+const D1_SCHEMA_STATEMENTS = [
+    `CREATE TABLE IF NOT EXISTS subscriptions (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE TABLE IF NOT EXISTS profiles (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE INDEX IF NOT EXISTS idx_subscriptions_updated_at ON subscriptions(updated_at);`,
+    `CREATE INDEX IF NOT EXISTS idx_profiles_updated_at ON profiles(updated_at);`,
+    `CREATE INDEX IF NOT EXISTS idx_settings_updated_at ON settings(updated_at);`,
+    `CREATE TABLE IF NOT EXISTS vps_nodes (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        tag TEXT,
+        region TEXT,
+        description TEXT,
+        secret TEXT NOT NULL,
+        status TEXT NOT NULL,
+        enabled INTEGER DEFAULT 1,
+        use_global_targets INTEGER DEFAULT 0,
+        last_seen_at DATETIME,
+        last_report_json TEXT,
+        overload_state_json TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE TABLE IF NOT EXISTS vps_reports (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        reported_at DATETIME NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        data TEXT NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS vps_alerts (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE INDEX IF NOT EXISTS idx_vps_nodes_updated_at ON vps_nodes(updated_at);`,
+    `CREATE INDEX IF NOT EXISTS idx_vps_reports_node_time ON vps_reports(node_id, reported_at);`,
+    `CREATE INDEX IF NOT EXISTS idx_vps_alerts_node_time ON vps_alerts(node_id, created_at);`,
+    `CREATE TABLE IF NOT EXISTS vps_network_targets (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        target TEXT NOT NULL,
+        scheme TEXT,
+        port INTEGER,
+        path TEXT,
+        enabled INTEGER DEFAULT 1,
+        force_check_at DATETIME,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE INDEX IF NOT EXISTS idx_vps_network_targets_node ON vps_network_targets(node_id, created_at);`,
+    `CREATE TABLE IF NOT EXISTS vps_network_samples (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        reported_at DATETIME NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        data TEXT NOT NULL
+    );`,
+    `CREATE INDEX IF NOT EXISTS idx_vps_network_samples_node_time ON vps_network_samples(node_id, reported_at);`
+];
+
+async function ensureD1Schema(d1Db) {
+    for (const statement of D1_SCHEMA_STATEMENTS) {
+        await d1Db.prepare(statement).run();
+    }
+}
+
 /**
  * KV 存储适配器
  */
@@ -230,7 +315,7 @@ class D1StorageAdapter {
 }
 
 /**
- * 无存储降级适配器（EdgeOne 纯环境变量模式，不读写持久数据）
+ * 无存储降级适配器（无可用持久化存储时，不读写持久数据）
  */
 class NoopStorageAdapter {
     async get() { return null; }
@@ -251,10 +336,8 @@ function isKVNamespace(val) {
 }
 
 /**
- * 解析 KV 命名空间
- * EdgeOne Pages: KV 作为全局变量注入（globalThis.MISUB_KV），而非通过 env
- * Cloudflare Pages: KV 通过 env.MISUB_KV 注入
- * 同时支持自动探测，兼容任意绑定名
+ * 解析 KV 命名空间。
+ * 优先读取 Cloudflare Pages 的 env 绑定，并兼容其他 env 中的 KV 绑定。
  * @param {Object} env
  * @returns {Object|null}
  */
@@ -262,10 +345,7 @@ function resolveKV(env) {
     // 1. Cloudflare Pages 方式：env.MISUB_KV
     if (env && isKVNamespace(env.MISUB_KV)) return env.MISUB_KV;
 
-    // 2. EdgeOne Pages 方式：KV 作为全局变量注入
-    if (typeof MISUB_KV !== 'undefined' && isKVNamespace(MISUB_KV)) return MISUB_KV;  // eslint-disable-line no-undef
-
-    // 3. 自动探测 env 中其他 KV 绑定（仅允许变量名包含 KV，避免误识别）
+    // 2. 自动探测 env 中其他 KV 绑定（仅允许变量名包含 KV，避免误识别）
     if (env) {
         for (const key of Object.keys(env)) {
             if (!String(key).toUpperCase().includes('KV')) continue;
@@ -274,19 +354,6 @@ function resolveKV(env) {
                 return env[key];
             }
         }
-    }
-
-    // 4. 自动探测 globalThis 中其他 KV 绑定（仅允许变量名包含 KV，避免误识别）
-    for (const key of Object.keys(globalThis)) {
-        if (key.startsWith('_') || key === 'globalThis') continue;
-        if (!String(key).toUpperCase().includes('KV')) continue;
-        try {
-            const val = globalThis[key];
-            if (isKVNamespace(val)) {
-                console.log(`[Storage] Auto-detected KV in globalThis: ${key}`);
-                return val;
-            }
-        } catch (_) { /* 忽略访问器异常 */ }
     }
 
     return null;
@@ -413,6 +480,31 @@ export class StorageFactory {
     }
 
     /**
+     * 将 KV Settings 同步到 D1（当 D1 为空时）
+     */
+    static async ensureD1Settings(env) {
+        if (!env?.MISUB_DB) return false;
+        try {
+            const d1Adapter = new D1StorageAdapter(env.MISUB_DB);
+            const existing = await d1Adapter.get(DATA_KEYS.SETTINGS);
+            if (existing) return true;
+            const kvNs = resolveKV(env);
+            if (!kvNs) return false;
+            const raw = await kvNs.get(DATA_KEYS.SETTINGS);
+            if (!raw) return false;
+            const settings = JSON.parse(raw);
+            if (settings?.storageType !== STORAGE_TYPES.D1) {
+                settings.storageType = STORAGE_TYPES.D1;
+            }
+            await d1Adapter.put(DATA_KEYS.SETTINGS, settings);
+            return true;
+        } catch (error) {
+            console.warn('[Storage] ensureD1Settings failed:', error?.message || error);
+            return false;
+        }
+    }
+
+    /**
      * 检查是否配置了双重存储
      * @param {Object} env - Cloudflare环境对象
      * @returns {boolean} 是否配置了双重存储
@@ -437,6 +529,7 @@ export class DataMigrator {
             if (!kvNs) throw new Error('No KV binding found');
             const kvAdapter = new KVStorageAdapter(kvNs);
             const d1Adapter = new D1StorageAdapter(env.MISUB_DB);
+            await ensureD1Schema(d1Adapter.db);
 
             const results = {
                 subscriptions: false,

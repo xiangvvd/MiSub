@@ -106,7 +106,7 @@ function opRename(nodes, params) {
         }
     }
 
-    if (template?.enabled && template.text) {
+    if (template?.enabled && template.template) {
         const counters = new Map();
         const scope = template.indexScope || template.scope || 'region'; // 默认按地区分组计数，符合用户直觉
 
@@ -130,10 +130,10 @@ function opRename(nodes, params) {
                 emoji: enriched.emoji,
                 server: r.server,
                 port: r.port,
-                index: groupIndex + (template.offset || 1) - 1,
-                globalIndex: index + (template.offset || 1)
+                index: groupIndex + (Number(template.offset || template.indexStart) || 1) - 1,
+                globalIndex: index + (Number(template.offset || template.indexStart) || 1)
             };
-            const newName = NodeUtils.renderTemplate(template.text, vars, r);
+            const newName = NodeUtils.renderTemplate(template.template, vars, r);
             
             if (newName !== r.name) {
                 return {
@@ -194,29 +194,33 @@ async function opScript(nodes, params, context) {
         };
 
         const wrapper = `
-            return (async () => {
-                const $proxies = Array.from(arguments[0]);
-                const $context = arguments[1];
-                const { $utils } = arguments[2];
-                
-                ${scriptCode}
+            ${scriptCode}
 
-                if (typeof operator === 'function') {
-                    const res = await operator($proxies, $context);
-                    // 兼容返回 { proxies: [] } 或 { nodes: [] } 的脚本
-                    if (res && !Array.isArray(res)) {
-                        return res.proxies || res.nodes || $proxies;
-                    }
-                    return res;
-                }
-                return $proxies;
-            })();
+            if (typeof operator === 'function') {
+                return await operator($proxies, $context);
+            }
+            return $proxies;
         `;
 
+        // 使用具名参数构造函数，避免在某些环境下 arguments 对象失效
         const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
-        const runner = new AsyncFunction(wrapper);
-        const result = await runner(enrichedNodes, context, scriptEnv);
-        return Array.isArray(result) ? result : nodes;
+        const runner = new AsyncFunction('$proxies', '$context', '$utils', wrapper);
+        
+        const processedNodes = enrichedNodes.map(n => {
+            // 手动注入小写别名，确保脚本兼容性
+            n.regionzh = n.regionZh;
+            n.region_zh = n.regionZh;
+            return n;
+        });
+
+        const runner = new AsyncFunction('$proxies', '$context', '$utils', wrapper);
+        const result = await runner(processedNodes, context, scriptEnv.$utils);
+        
+        // 彻底简化返回逻辑，直接使用结果
+        if (Array.isArray(result)) {
+            return result;
+        }
+        return nodes;
     } catch (e) {
         console.error('[Operator] Script execution failed:', e);
         return nodes;
